@@ -1,0 +1,324 @@
+import numpy as np
+import pybullet as p
+import pybullet_data
+import matplotlib.pyplot as plt
+from pyniryo import *
+from pymoo.core.problem import Problem
+from pymoo.algorithms.moo.moead import MOEAD
+from pymoo.problems.multi import *
+from pymoo.operators.sampling.lhs import LHS
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PolynomialMutation, PM
+from pymoo.termination import get_termination
+from pymoo.optimize import minimize
+from pymoo.util.ref_dirs import get_reference_directions
+from scipy.spatial.transform import Rotation as R
+from scipy.interpolate import splrep, splev
+from sklearn.neural_network import MLPRegressor
+from sklearn.model_selection import train_test_split
+import os
+# 機械手臂類別
+class RobotArm:
+    """機械手臂類別，支援模擬與真實機器人操作。
+
+    Args:
+        urdf_path (str): URDF 文件路徑。
+        use_sim (bool): 是否使用模擬環境，預設為 True。
+        real_ip (str, optional): 真實機器人 IP 地址。
+        friction_coeff (float): 摩擦係數，預設為 0.1。
+    """
+    def __init__(self, urdf_path, use_sim=True, real_ip=None, friction_coeff=0.1):
+        # 檢查 URDF 文件是否存在
+        if use_sim and not os.path.exists(urdf_path):
+            raise FileNotFoundError(f"URDF file not found: {urdf_path}")
+        if not use_sim and not real_ip:
+            raise ValueError("real_ip must be provided when use_sim is False")
+        if friction_coeff < 0:
+            raise ValueError("friction_coeff must be non-negative")
+
+        self.use_sim = use_sim
+        self.friction_coeff = friction_coeff
+        self._setup_robot(urdf_path, real_ip)
+
+    def _setup_robot(self, urdf_path, real_ip):
+        """初始化模擬或真實機器人環境"""
+        if self.use_sim:
+            self.client = p.connect(p.DIRECT)
+            p.setGravity(0, 0, -9.81)
+            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            p.loadURDF("plane.urdf", useFixedBase=True)
+            self.robot_id = p.loadURDF(urdf_path, useFixedBase=True)
+            self.joint_indices = [i for i in range(p.getNumJoints(self.robot_id))
+                                 if p.getJointInfo(self.robot_id, i)[2] == p.JOINT_REVOLUTE]
+            self.num_joints = len(self.joint_indices)
+            # 假設末端執行器是最後一個關節（需根據 URDF 確認）
+            self.end_effector_index = max(self.joint_indices)
+        else:
+            self.niryo = NiryoRobot(real_ip)
+            self.niryo.calibrate()
+            self.joint_indices = [0, 1, 2, 3, 4, 5]
+            self.num_joints = len(self.joint_indices)
+
+        for i in range(p.getNumJoints(self.robot_id)):
+            print(p.getJointInfo(self.robot_id, i))
+
+    def forward_kinematics(self, joint_angles):
+        """計算正向運動學，返回位置與四元數"""
+        if self.use_sim:
+            # 設置關節角度
+            for idx, angle in zip(self.joint_indices, joint_angles):
+                p.resetJointState(self.robot_id, idx, angle)
+            # 獲取末端執行器的位置和四元數
+            link_state = p.getLinkState(self.robot_id, self.end_effector_index)
+            pos = np.array(link_state[0])  # 位置 (x, y, z)
+            quat = np.array(link_state[1])  # 四元數 (x, y, z, w)
+            return pos, quat
+        return self.niryo.forward_kinematics(joint_angles)
+
+    def compute_torques(self, q, v, a):
+        """計算關節扭矩，包含摩擦力"""
+        if self.use_sim:
+            # 設置關節狀態
+            for idx, angle, vel in zip(self.joint_indices, q, v):
+                p.resetJointState(self.robot_id, idx, angle, vel)
+            # 使用 PyBullet 的逆動力學計算扭矩
+            tau = p.calculateInverseDynamics(self.robot_id, q.tolist(), v.tolist(), a.tolist())
+            tau = np.array(tau)[:self.num_joints]
+            # 加入摩擦力
+            return tau - self.friction_coeff * v
+        return np.zeros(self.num_joints)
+
+    def close(self):
+        """關閉模擬環境"""
+        if self.use_sim and hasattr(self, 'client'):
+            p.disconnect(self.client)
+
+# 代理模型類別
+class SurrogateModel:
+    """用於近似正向運動學與扭矩的代理模型"""
+    def __init__(self, robot):
+        self.robot = robot
+        self.fk_pos_model = MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=1000)
+        self.fk_quat_model = MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=1000)
+        self.torque_model = MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=1000)
+        self._train_models()
+
+    def _train_models(self):
+        """訓練代理模型並進行驗證"""
+        try:
+            n_samples = 10000
+            q = np.random.uniform(-np.pi, np.pi, (n_samples, self.robot.num_joints))
+            v = np.random.uniform(-1, 1, (n_samples, self.robot.num_joints))
+            a = np.random.uniform(-1, 1, (n_samples, self.robot.num_joints))
+
+            fk_data = [self.robot.forward_kinematics(qi) for qi in q]
+            pos = np.array([fk[0] for fk in fk_data])
+            quat = np.array([fk[1] for fk in fk_data])
+            torques = np.array([self.robot.compute_torques(qi, vi, ai) for qi, vi, ai in zip(q, v, a)])
+
+            # 分割訓練與測試數據
+            q_train, q_test, pos_train, pos_test = train_test_split(q, pos, test_size=0.2, random_state=42)
+            q_train_quat, q_test_quat, quat_train, quat_test = train_test_split(q, quat, test_size=0.2, random_state=42)
+            X_torque = np.hstack([q, v, a])
+            X_torque_train, X_torque_test, t_train, t_test = train_test_split(X_torque, torques, test_size=0.2, random_state=42)
+
+            # 訓練模型
+            self.fk_pos_model.fit(q_train, pos_train)
+            self.fk_quat_model.fit(q_train_quat, quat_train)
+            self.torque_model.fit(X_torque_train, t_train)
+
+            # 模型驗證
+            pos_pred = self.fk_pos_model.predict(q_test)
+            mse_pos = np.mean((pos_pred - pos_test)**2)
+            print(f"Position MSE: {mse_pos}")
+            quat_pred = self.fk_quat_model.predict(q_test_quat)
+            mse_quat = np.mean((quat_pred - quat_test)**2)
+            print(f"Quaternion MSE: {mse_quat}")
+            torque_pred = self.torque_model.predict(X_torque_test)
+            mse_torque = np.mean((torque_pred - t_test)**2)
+            print(f"Torque MSE: {mse_torque}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to train surrogate models: {str(e)}")
+
+    def predict_fk(self, joint_angles):
+        """預測正向運動學結果"""
+        pos = self.fk_pos_model.predict(joint_angles.reshape(1, -1))[0]
+        quat = self.fk_quat_model.predict(joint_angles.reshape(1, -1))[0]
+        return pos, quat
+
+    def predict_torque(self, q, v, a):
+        """預測扭矩"""
+        input_data = np.hstack([q, v, a]).reshape(1, -1)
+        return self.torque_model.predict(input_data)[0]
+
+# B-spline 軌跡生成
+def compute_bspline_trajectory(waypoints, dt, degree=5, num_samples=None):
+    """生成 B-spline 軌跡並檢查連續性
+
+    Args:
+        waypoints (np.ndarray): 路徑點，形狀 (n, 3)。
+        dt (float): 時間步長。
+        degree (int): B-spline 階數，預設為 5。
+        num_samples (int, optional): 輸出樣本數，預設為路徑點數。
+
+    Returns:
+        tuple: 位置、速度、加速度、加加速度的陣列。
+    """
+    T = waypoints.shape[0]
+    num_samples = num_samples or T
+    t = np.linspace(0, 1, T)
+    ts = np.linspace(0, 1, num_samples)
+    coeffs = [splrep(t, waypoints[:, d], k=degree, s=0) for d in range(3)]
+    pos = np.stack([splev(ts, c, der=0) for c in coeffs], axis=1)
+    vel = np.stack([splev(ts, c, der=1) for c in coeffs], axis=1) / dt
+    acc = np.stack([splev(ts, c, der=2) for c in coeffs], axis=1) / dt**2
+    jerk = np.stack([splev(ts, c, der=3) for c in coeffs], axis=1) / dt**3
+
+    # 檢查連續性
+    vel_diff = np.diff(vel, axis=0)
+    acc_diff = np.diff(acc, axis=0)
+    threshold = 1.0
+    if np.any(np.abs(vel_diff) > threshold):
+        print("Warning: Velocity discontinuity detected")
+    if np.any(np.abs(acc_diff) > threshold):
+        print("Warning: Acceleration discontinuity detected")
+    return pos, vel, acc, jerk
+
+# 簽名距離場（SDF）計算
+def sdf_obstacle(pos, obstacles, safe_dist=0.03):
+    """計算簽名距離場以檢測障礙物
+
+    Args:
+        pos (np.ndarray): 位置點，形狀 (n, 3)。
+        obstacles (np.ndarray): 障礙物位置，形狀 (m, 3)。
+        safe_dist (float): 安全距離，預設為 0.03。
+
+    Returns:
+        float: SDF 懲罰值。
+    """
+    dists = np.min([np.linalg.norm(pos - o, axis=1) for o in obstacles], axis=0)
+    return np.sum(np.maximum(0, safe_dist - dists)**2)
+
+# 多目標路徑規劃問題
+class PathPlanningProblem(Problem):
+    """多目標路徑規劃問題
+
+    Args:
+        robot (RobotArm): 機械手臂實例。
+        surrogate (SurrogateModel): 代理模型實例。
+        n_points (int): 軌跡點數。
+        dt (float): 時間步長。
+        v_max (float): 最大速度。
+        a_max (float): 最大加速度。
+        tau_max (float): 最大扭矩。
+        z_range (tuple): Z 軸範圍 (min, max)。
+        obstacles (list): 障礙物位置列表。
+        weights (np.ndarray, optional): 目標權重，預設為均等。
+    """
+    def __init__(self, robot, surrogate, n_points, dt, v_max, a_max, tau_max, z_range, obstacles, weights=None):
+        if n_points < 2:
+            raise ValueError("n_points must be at least 2")
+        if dt <= 0:
+            raise ValueError("dt must be positive")
+        if v_max <= 0 or a_max <= 0 or tau_max <= 0:
+            raise ValueError("v_max, a_max, and tau_max must be positive")
+
+        self.robot = robot
+        self.surrogate = surrogate
+        self.n_points, self.dt = n_points, dt
+        self.v_max, self.a_max, self.tau_max = v_max, a_max, tau_max
+        self.zmin, self.zmax = z_range
+        self.obstacles = np.array(obstacles)
+        self.weights = weights if weights is not None else np.ones(6)
+        if len(self.weights) != 6:
+            raise ValueError("weights must have length 6")
+        super().__init__(n_var=n_points * robot.num_joints, n_obj=6, n_constr=0, xl=-np.pi, xu=np.pi)
+
+    def check_collision(self, pos):
+        """檢查碰撞"""
+        for pt in pos:
+            p.resetBasePositionAndOrientation(self.robot.robot_id, pt, [0, 0, 0, 1])
+            if p.getContactPoints(self.robot.robot_id):
+                return 1
+        return 0
+
+    def compute_trajectory(self, q_traj):
+        """用代理模型計算平滑軌跡"""
+        P = np.vstack([self.surrogate.predict_fk(q)[0] for q in q_traj])
+        return compute_bspline_trajectory(P, self.dt)
+
+    def _compute_objectives(self, pos, vel, acc, jerk, q_traj, torques):
+        """計算目標函數"""
+        O = R.from_quat([self.surrogate.predict_fk(q)[1] for q in q_traj])
+        dtheta = np.linalg.norm(np.gradient(q_traj, self.dt, axis=0), axis=1)
+        ori_err = np.linalg.norm((O[1:] * O[:-1].inv()).as_rotvec(), axis=1)
+
+        return [
+            self.dt * (self.n_points - 1),  # 總時間
+            np.sum(np.linalg.norm(pos[1:] - pos[:-1], axis=1)),  # 路徑長度
+            np.sum(np.linalg.norm(jerk, axis=1)**2 + np.linalg.norm(acc, axis=1)**2 +
+                   np.linalg.norm(vel - np.mean(vel, axis=0), axis=1)**2),  # 平滑度
+            np.sum(np.abs(torques) * dtheta[:, None]),  # 能量消耗
+            np.sum(ori_err),  # 方向誤差
+            sdf_obstacle(pos, self.obstacles) + self.check_collision(pos)  # 避障
+        ]
+
+    def _compute_constraints(self, pos, vel, acc, q_traj):
+        """計算約束"""
+        return [
+            np.max(np.linalg.norm(vel, axis=1)) - self.v_max,
+            np.max(np.linalg.norm(acc, axis=1)) - self.a_max,
+            np.max(np.abs(q_traj)) - np.pi,
+            np.sum((pos[:, 2] < self.zmin) | (pos[:, 2] > self.zmax))
+        ]
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        pop_size = X.shape[0]
+        F = np.zeros((pop_size, 6))
+        F_max = np.array([10.0, 1.0, 100.0, 50.0, 5.0, 1.0])
+
+        for i in range(pop_size):
+            q_traj = X[i].reshape(self.n_points, -1)
+            pos, vel, acc, jerk = self.compute_trajectory(q_traj)
+            torques = np.vstack([self.surrogate.predict_torque(q_traj[k], vel[k], acc[k]) 
+                                for k in range(self.n_points)])
+
+            F[i] = self._compute_objectives(pos, vel, acc, jerk, q_traj, torques)
+            F[i] = (F[i] / F_max) * self.weights
+
+            # 計算約束違反並轉化為懲罰項
+            constraints = self._compute_constraints(pos, vel, acc, q_traj)
+            penalty = 1000 * np.sum(np.maximum(0, constraints))
+            F[i] += penalty  # 將懲罰項加到每個目標
+
+        out["F"] = F
+
+def main():
+    """主執行函數"""
+    # 使用 PyBullet 提供的 KUKA IIWA URDF
+    # 替代方案：若有 niryo_ned2.urdf，請替換為正確路徑，例如 "./niryo_ned2.urdf"
+    urdf = os.path.join(pybullet_data.getDataPath(), "niryo/niryo_ned2.urdf")
+
+    robot = None  # 初始化 robot 為 None 以避免 NameError
+    try:
+        robot = RobotArm(urdf, use_sim=True)
+        surrogate = SurrogateModel(robot)
+        weights = np.array([0.2, 0.2, 0.3, 0.2, 0.1, 0.5])  # 可根據需求調整
+        problem = PathPlanningProblem(robot, surrogate, n_points=30, dt=0.05,
+                                      v_max=1.0, a_max=2.0, tau_max=5.0,
+                                      z_range=(0.05, 0.45), obstacles=[[0.2, 0, 0.1]], weights=weights)
+        ref_dirs = get_reference_directions("das-dennis", 6, n_partitions=12)
+        # TODO: 未來可進行 MOEAD 參數調優，例如 n_neighbors 和 prob_neighbor_mating
+        algorithm = MOEAD(ref_dirs, n_neighbors=15, prob_neighbor_mating=0.7)
+        res = minimize(problem, algorithm, get_termination("n_gen", 200), seed=42, verbose=True)
+        print("Pareto 最佳解目標值：")
+        for f in res.F:
+            print(np.round(f, 3))
+    except Exception as e:
+        print(f"Error during execution: {str(e)}")
+    finally:
+        if robot is not None:
+            robot.close()
+
+if __name__ == "__main__":
+    main()
